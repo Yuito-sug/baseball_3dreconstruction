@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Model weights and training checkpoints
+3d_ball_tracking/2d_ball_detection/model_weights/
+*.safetensors
+training_state.pt
+*.pt
+*.pth
+
+
+

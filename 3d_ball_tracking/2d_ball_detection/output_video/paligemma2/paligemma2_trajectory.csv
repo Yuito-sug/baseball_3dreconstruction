@@ -1,0 +1,29 @@
+﻿frame_index,timestamp_sec,detected,x_center,y_center,x1,y1,x2,y2,generated_text
+0,0.0,False,,,,,,,pitcher strikes out a batter with a fastball
+1,0.033333,False,,,,,,,pitcher strikes out a batter with a fastball
+2,0.066667,False,,,,,,,pitcher strikes out a batter with a fastball
+3,0.1,False,,,,,,,batting in the 4th inning of a game
+4,0.133333,False,,,,,,,batting in the 3rd inning
+5,0.166667,False,,,,,,,batting in the 2nd inning
+6,0.2,False,,,,,,,batting 1 on 1
+7,0.233333,False,,,,,,,batting 1 on 1
+8,0.266667,False,,,,,,,home run in the 2nd inning
+9,0.3,False,,,,,,,home run in the 3rd inning
+10,0.333333,False,,,,,,,home run in the 2nd inning
+11,0.366667,False,,,,,,,pitcher strikes out a batter with a fastball
+12,0.4,False,,,,,,,pitcher strikes out a batter with a fastball
+13,0.433333,False,,,,,,,pitcher strikes out a batter with a fastball
+14,0.466667,False,,,,,,,pitcher strikes out a batter with a fastball
+15,0.5,False,,,,,,,pitcher strikes out a batter with a fastball
+16,0.533333,False,,,,,,,pitcher strikes out baseball player in the 1st inning
+17,0.566667,False,,,,,,,pitcher strikes out baseball player in the 1st inning
+18,0.6,False,,,,,,,pitcher strikes out baseball player in the 3rd inning
+19,0.633333,False,,,,,,,pitcher strikes out baseball player with a fastball
+20,0.666667,False,,,,,,,pitcher strikes out a batter with a fastball
+21,0.7,False,,,,,,,pitcher strikes out baseball player with a fastball
+22,0.733333,False,,,,,,,pitcher strikes out baseball player with a fastball
+23,0.766667,False,,,,,,,pitcher strikes out baseball player with a fastball
+24,0.8,False,,,,,,,pitcher strikes out baseball player with a fastball
+25,0.833333,False,,,,,,,pitcher strikes out baseball player in the 3rd inning
+26,0.866667,False,,,,,,,baseball player hit by a pitch
+27,0.9,False,,,,,,,bat vs fastball
