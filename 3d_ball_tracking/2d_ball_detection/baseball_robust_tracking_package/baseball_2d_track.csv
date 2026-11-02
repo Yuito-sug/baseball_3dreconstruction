@@ -1,0 +1,29 @@
+﻿frame,time_sec,x_px,y_px,status,confidence,source
+0,0.0,,,not_tracked,,
+1,0.0333,,,not_tracked,,
+2,0.0667,,,not_tracked,,
+3,0.1,,,not_tracked,,
+4,0.1333,,,not_tracked,,
+5,0.1667,,,not_tracked,,
+6,0.2,,,not_tracked,,
+7,0.2333,,,not_tracked,,
+8,0.2667,,,not_tracked,,
+9,0.3,,,not_tracked,,
+10,0.3333,,,not_tracked,,
+11,0.3667,850.06,219.75,detected-release,0.944,opencv-classical
+12,0.4,866.9,250.78,detected,0.92,opencv-classical
+13,0.4333,885.63,283.53,detected,0.85,opencv-classical
+14,0.4667,906.64,320.85,detected,0.85,opencv-classical
+15,0.5,906.64,320.85,duplicate-frame-copy,0.85,opencv-classical
+16,0.5333,980.43,449.79,detected,0.801,opencv-classical
+17,0.5667,980.43,449.79,duplicate-frame-copy,0.801,opencv-classical
+18,0.6,1009.35,498.46,detected,0.971,opencv-classical
+19,0.6333,1043.77,555.68,detected,0.774,opencv-classical
+20,0.6667,1079.22,616.31,detected,0.838,opencv-classical
+21,0.7,1079.22,616.31,duplicate-frame-copy,0.838,opencv-classical
+22,0.7333,1114.68,676.93,occlusion-estimate,0.25,trajectory extrapolation
+23,0.7667,1114.68,676.93,occlusion-estimate-duplicate,0.25,trajectory extrapolation
+24,0.8,1150.14,737.55,estimated-receiving-area,0.25,trajectory extrapolation
+25,0.8333,,,not_tracked,,
+26,0.8667,,,not_tracked,,
+27,0.9,,,not_tracked,,
