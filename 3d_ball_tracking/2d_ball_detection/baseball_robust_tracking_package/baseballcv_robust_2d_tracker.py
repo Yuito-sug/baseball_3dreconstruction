@@ -1,391 +1,947 @@
+
 #!/usr/bin/env python3
-"""Robust 2D baseball tracking prototype.
+# -*- coding: utf-8 -*-
 
-Backend 'auto' uses BaseballCV's pretrained YOLO ball_tracking model when
-BaseballCV + Ultralytics + weights are available. Otherwise it falls back to
-an OpenCV bright-compact-blob detector with temporal direction/continuity gates.
-The fallback is not a trained neural network and should be treated as a baseline.
-
-Example:
-  python baseballcv_robust_2d_tracker.py input.mp4 --output tracked.mp4 --backend auto
 """
-from __future__ import annotations
-import argparse, csv, math, os
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
+Robust 2D Baseball Tracking Prototype
+========================================
+Usage:
+python baseballcv_robust_2d_tracker.py input.mp4 \
+    --output tracked.mp4 \
+    --csv tracked.csv \
+    --backend auto
+
+Backends:
+- auto: Try BaseballCV pretrained detector; fallback to safe mode
+- baseballcv-yolo: Use BaseballCV pretrained detector
+- opencv-classical: Use classical OpenCV motion detection
+
+Important:
+This is a prototype. It cannot guarantee accurate tracking on every video.
+Occlusion positions are estimates, not detections.
+"""
+
+import argparse
+import csv
+import math
+import os
+import sys
+
 import cv2
 import numpy as np
 
-@dataclass
-class Candidate:
-    x: float
-    y: float
-    area: float
-    w: int
-    h: int
-    conf: float = 0.0
 
-@dataclass
-class TrackPoint:
-    frame: int
-    x: float
-    y: float
-    status: str
-    confidence: float
-    source: str
+# ============================================================
+# Video utilities
+# ============================================================
 
-class OpenCVBallDetector:
-    """Bright compact-object detector with resolution-aware, aspect-aware ROI."""
-    def __init__(self, threshold: int = 185, saturation_max: int = 135,
-                 roi=None):
-        self.threshold = threshold
-        self.saturation_max = saturation_max
-        # Optional ROI is expressed in pixels of a 1920x1080 reference frame.
-        # None selects a broad ROI based on the actual video's aspect ratio.
-        self.roi = roi
+def load_video(path):
+    cap = cv2.VideoCapture(path)
 
-    @staticmethod
-    def _merge_nearby(comps, radius=12.0):
-        # Union-find merges components when the ball is split by a dark net wire.
-        if not comps:
-            return []
-        n = len(comps); parent = list(range(n))
-        def find(i):
-            while parent[i] != i:
-                parent[i] = parent[parent[i]]; i = parent[i]
-            return i
-        def union(a,b):
-            ra,rb=find(a),find(b)
-            if ra!=rb: parent[rb]=ra
-        for i in range(n):
-            for j in range(i+1,n):
-                if math.hypot(comps[i].x-comps[j].x, comps[i].y-comps[j].y) <= radius:
-                    union(i,j)
-        groups={}
-        for i,c in enumerate(comps): groups.setdefault(find(i),[]).append(c)
-        out=[]
-        for group in groups.values():
-            area=sum(c.area for c in group)
-            x=sum(c.x*c.area for c in group)/area
-            y=sum(c.y*c.area for c in group)/area
-            x1=min(c.x-c.w/2 for c in group); x2=max(c.x+c.w/2 for c in group)
-            y1=min(c.y-c.h/2 for c in group); y2=max(c.y+c.h/2 for c in group)
-            w=max(1,int(round(x2-x1))); h=max(1,int(round(y2-y1)))
-            out.append(Candidate(x,y,area,w,h,max(c.conf for c in group)))
-        return out
-
-    def detect(self, frame):
-        H, W = frame.shape[:2]
-        if self.roi is None:
-            # Portrait/behind-home-plate views place the pitcher and ball on the
-            # right half; landscape broadcast views need a wider central ROI.
-            if W / max(H, 1) < 0.95:
-                x1, y1, x2, y2 = int(0.40*W), int(0.30*H), W, int(0.90*H)
-            else:
-                # Preserve the original reference-view ROI, scaled to this frame size.
-                x1, y1 = int(780*W/1920), int(170*H/1080)
-                x2, y2 = int(1230*W/1920), int(780*H/1080)
-        else:
-            rx1, ry1, rx2, ry2 = self.roi
-            x1, y1 = int(rx1*W/1920), int(ry1*H/1080)
-            x2, y2 = int(rx2*W/1920), int(ry2*H/1080)
-        # Clamp all coordinates. Empty crops are reported as no candidates rather
-        # than passed to cvtColor (which raises !_src.empty()).
-        x1 = max(0, min(W, x1)); x2 = max(0, min(W, x2))
-        y1 = max(0, min(H, y1)); y2 = max(0, min(H, y2))
-        if x2 <= x1 or y2 <= y1:
-            return []
-        crop=frame[y1:y2,x1:x2]
-        if crop.size == 0:
-            return []
-        hsv=cv2.cvtColor(crop,cv2.COLOR_BGR2HSV)
-        mask=((hsv[:,:,2] > self.threshold) & (hsv[:,:,1] < self.saturation_max)).astype(np.uint8)*255
-        # Connected components provide compact bright candidates. Filtering is deliberately
-        # permissive; temporal tracking and trajectory gates reject most distractors.
-        n, labels, stats, centroids=cv2.connectedComponentsWithStats(mask,8)
-        comps=[]
-        for i in range(1,n):
-            x,y,w,h,area=stats[i]
-            cx,cy=centroids[i]
-            if not (18 <= area <= 420 and 5 <= w <= 30 and 4 <= h <= 30):
-                continue
-            if not (0.28 <= (w/max(h,1)) <= 5.0):
-                continue
-            cx+=x1; cy+=y1
-            # Prefer roundish, compact components whose area looks ball-sized.
-            aspect=min(w/max(h,1),h/max(w,1))
-            size_score=math.exp(-abs(math.log(max(area,1)/125.0)))
-            shape_score=math.sqrt(aspect)
-            conf=float(np.clip(0.25+0.48*size_score+0.27*shape_score,0,0.99))
-            comps.append(Candidate(float(cx),float(cy),float(area),int(w),int(h),conf))
-        return self._merge_nearby(comps, radius=12.0)
-
-class BaseballCVYoloDetector:
-    """Optional BaseballCV pretrained YOLO backend, following the project README API."""
-    def __init__(self, conf=0.005, imgsz=1280):
-        from baseballcv.functions import LoadTools
-        from ultralytics import YOLO
-        path=LoadTools().load_model('ball_tracking')
-        self.model=YOLO(path)
-        self.conf=conf; self.imgsz=imgsz
-    def detect(self, frame):
-        result=self.model.predict(frame, conf=self.conf, imgsz=self.imgsz, verbose=False)[0]
-        out=[]
-        if result.boxes is None: return out
-        for b in result.boxes:
-            x1,y1,x2,y2=map(float,b.xyxy[0].cpu().numpy())
-            conf=float(b.conf[0].cpu().numpy())
-            # Keep small objects for ball tracking; large boxes are likely false positives.
-            w=x2-x1; h=y2-y1
-            if w<3 or h<3 or w>70 or h>70: continue
-            out.append(Candidate((x1+x2)/2,(y1+y2)/2,w*h,int(round(w)),int(round(h)),conf))
-        return out
-
-def mean_frame_difference(a,b):
-    return float(np.mean(cv2.absdiff(a,b)))
-
-def predict_position(history, next_unique_index, direction_x=1, scale_x=1.0, scale_y=1.0):
-    """Predict next center using recent observations and camera-dependent direction."""
-    if len(history)==1:
-        p=history[-1]
-        return np.array([p.x + direction_x*17.0*scale_x, p.y + 32.0*scale_y])
-    xy=np.array([[p.x,p.y] for p in history[-5:]],float)
-    t=np.arange(len(history)-len(xy),len(history),dtype=float)
-    future=float(len(history))
-    velocity=xy[-1]-xy[-2]
-    linear=xy[-1]+velocity
-    if len(xy)>=3:
-        deg=min(2,len(xy)-1)
-        pred=[]
-        for axis in range(2):
-            co=np.polyfit(t,xy[:,axis],deg=deg)
-            pred.append(float(np.polyval(co,future)))
-        quad=np.array(pred)
-        return 0.65*linear+0.35*quad
-    return linear
-
-def track_frames(frames, backend='auto', force_opencv=False):
-    if not frames:
-        raise RuntimeError('Input video contains no readable frames.')
-    H, W = frames[0].shape[:2]
-    portrait = (W / max(H, 1)) < 0.95
-    direction_x = -1 if portrait else 1
-    scale_x = W / 1920.0
-    scale_y = H / 1080.0
-
-    model=None; backend_used='opencv-classical'
-    if backend in ('auto','baseballcv-yolo') and not force_opencv:
-        try:
-            model=BaseballCVYoloDetector()
-            backend_used='BaseballCV YOLO ball_tracking'
-        except Exception as e:
-            if backend == 'baseballcv-yolo':
-                raise RuntimeError(f'BaseballCV YOLO backend unavailable: {e}') from e
-            model=None
-    if model is None:
-        model=OpenCVBallDetector(threshold=185)
-    candidates=[model.detect(f) for f in frames]
-
-    # Camera-dependent release search zone. These are normalized coordinates,
-    # not hard-coded 1920x1080 pixel positions.
-    if portrait:
-        release_zone=(0.58*W, 0.47*H, 0.78*W, 0.67*H)
-    else:
-        # Preserve the original landscape release zone, now expressed as ratios.
-        release_zone=(820*W/1920, 190*H/1080, 885*W/1920, 250*H/1080)
-    rx1, ry1, rx2, ry2 = release_zone
-    seed=None
-    for fi,cs in enumerate(candidates):
-        matches=[]
-        for c in cs:
-            if rx1 <= c.x <= rx2 and ry1 <= c.y <= ry2 and 25 <= c.area <= 300:
-                # Favor compact, near-white candidates near the expected release region.
-                cx0=(rx1+rx2)/2; cy0=(ry1+ry2)/2
-                scale=max(0.01, min(W,H)/1080.0)
-                score=(abs(c.x-cx0)/max((rx2-rx1)/2,1) +
-                       abs(c.y-cy0)/max((ry2-ry1)/2,1) +
-                       0.15*abs(math.log(max(c.area,1)/100.0)))
-                matches.append((score,c))
-        if matches:
-            _,c=min(matches,key=lambda z:z[0]); seed=(fi,c); break
-    if seed is None:
-        raise RuntimeError(
-            'Could not find a release-zone candidate. The clip may use a different camera angle; '
-            'adjust the normalized release zone in track_frames() or use --backend baseballcv-yolo.'
-        )
-    start_frame, sc=seed
-    points=[]; history=[]; unique_idx=0
-    first=TrackPoint(start_frame,sc.x,sc.y,'detected-release',sc.conf,backend_used)
-    points.append(first); history.append(first)
-    last_idx=start_frame; last_point=first
-    for fi in range(start_frame+1,len(frames)):
-        delta=mean_frame_difference(frames[fi-1],frames[fi])
-        if delta < 0.45:
-            pt=TrackPoint(fi,last_point.x,last_point.y,'duplicate-frame-copy',last_point.confidence,backend_used)
-            points.append(pt); last_idx=fi; last_point=pt
-            continue
-        cs=candidates[fi]
-        pred=predict_position(history,unique_idx+1,direction_x,scale_x,scale_y)
-        viable=[]
-        prev=history[-1]
-        for c in cs:
-            dx=c.x-prev.x; dy=c.y-prev.y
-            # Infer the horizontal direction from image aspect ratio; vertical
-            # motion is downward in the two supported broadcast views.
-            if direction_x*dx < -2.0*scale_x or dy < -3.0*scale_y:
-                continue
-            if portrait:
-                # Behind-home-plate portrait clips in this sample have a much
-                # slower screen-space displacement than the original landscape clip.
-                # This rejects catcher/helmet highlights that jump too far per frame.
-                if abs(dx) > 80*scale_x or dy > 65*scale_y:
-                    continue
-            else:
-                if abs(dx) > 150*max(scale_x,scale_y) or dy > 180*max(scale_x,scale_y):
-                    continue
-            d=float(np.linalg.norm(np.array([c.x,c.y])-pred))
-            gate=max(32.0,155.0*max(scale_x,scale_y)) if len(history)<5 else max(24.0,115.0*max(scale_x,scale_y))
-            if d > gate: continue
-            # Require the candidate to move in the same general direction.
-            if abs(dx) > 1 and abs(dy) > 1:
-                ratio=abs(dx)/max(abs(dy),1)
-                if not (0.05 <= ratio <= 4.0): continue
-            score=d - 8.0*c.conf + 0.10*abs(math.log(max(c.area,1)/100.0))
-            viable.append((score,c,d))
-        if not viable:
-            # A missed frame is tolerated; do not jump to another bright object.
-            continue
-        score,c,d=min(viable,key=lambda z:z[0])
-        pt=TrackPoint(fi,c.x,c.y,'detected',float(c.conf),backend_used)
-        points.append(pt); history.append(pt); last_idx=fi; last_point=pt; unique_idx+=1
-
-    distinct=[p for p in points if p.status in ('detected','detected-release')]
-    if not distinct:
-        raise RuntimeError('No ball candidates were tracked after release detection.')
-    last_obs=distinct[-1]
-    # Estimate continuation from recent visible motion. Keep the direction sign
-    # and use resolution-scaled bounds; endpoint is NOT asserted to be a catch.
-    if len(distinct)>=2:
-        v=np.array([distinct[-1].x-distinct[-2].x,distinct[-1].y-distinct[-2].y],float)
-    else:
-        v=np.array([direction_x*12.0*scale_x,18.0*scale_y])
-    min_vx=1.0*scale_x; max_vx=45.0*scale_x
-    v[0]=direction_x*float(np.clip(abs(v[0]),min_vx,max_vx))
-    v[1]=float(np.clip(v[1],2.0*scale_y,75.0*scale_y))
-    # Occlusion begins after the last actual observation. Stop at frame bounds.
-    occ=[]
-    base=np.array([last_obs.x,last_obs.y],float)
-    start_occ=last_obs.frame+1
-    prior=base.copy()
-    for fi in range(start_occ,min(len(frames),start_occ+3)):
-        if mean_frame_difference(frames[fi-1],frames[fi]) < 0.45:
-            pos=prior.copy(); status='occlusion-estimate-duplicate'
-        else:
-            pos=prior+v; status='occlusion-estimate'
-        pos[0]=float(np.clip(pos[0],0,W-1)); pos[1]=float(np.clip(pos[1],0,H-1))
-        occ.append((fi,pos,status)); prior=pos
-    return points, occ, start_frame, last_obs.frame, backend_used, candidates
-
-def status_prev_dup(frames, fi):
-    return mean_frame_difference(frames[fi-1],frames[fi]) < 0.45
-
-def draw_dashed_line(img,p1,p2,color,thickness=3,dash=12,gap=8):
-    p1=np.array(p1,float); p2=np.array(p2,float); vec=p2-p1; length=float(np.linalg.norm(vec))
-    if length<1:return
-    unit=vec/length; d=0.0
-    while d<length:
-        e=min(d+dash,length)
-        a=tuple(np.round(p1+unit*d).astype(int)); b=tuple(np.round(p1+unit*e).astype(int))
-        cv2.line(img,a,b,color,thickness,cv2.LINE_AA); d=e+gap
-
-def render(input_path, output_path, csv_path, backend='auto'):
-    cap=cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        raise RuntimeError(f'Could not open input video: {input_path}')
-    fps=cap.get(cv2.CAP_PROP_FPS) or 30.0; W=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frames=[]
+        raise RuntimeError(f"Cannot open video: {path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0:
+        fps = 30.0
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    frames = []
+
     while True:
-        ok,f=cap.read()
-        if not ok:break
-        frames.append(f)
-    cap.release()
-    if not frames:
-        raise RuntimeError(f'No frames could be decoded from: {input_path}')
-    points,occ,start,last,backend_used,candidates=track_frames(frames,backend=backend)
-    byframe={p.frame:p for p in points}
-    occmap={i:(xy,st) for i,xy,st in occ}
-    # Observed/detected points as a piecewise path; draw a solid green segment only between actual observed detections.
-    actual=[p for p in points if p.status in ('detected','detected-release')]
-    unique_actual=[]
-    for p in actual:
-        if unique_actual and np.linalg.norm(np.array([p.x,p.y])-np.array([unique_actual[-1].x,unique_actual[-1].y]))<0.1:
+        ret, frame = cap.read()
+
+        if not ret:
+            break
+
+        if frame is None or frame.size == 0:
             continue
-        unique_actual.append(p)
-    # dashed inference joins last visible location to estimated points
-    fourcc=cv2.VideoWriter_fourcc(*'mp4v'); writer=cv2.VideoWriter(output_path,fourcc,fps,(W,H))
+
+        frames.append(frame)
+
+    cap.release()
+
+    if len(frames) == 0:
+        raise RuntimeError("No valid frames found in video.")
+
+    return frames, fps, width, height
+
+
+# ============================================================
+# BaseballCV detector
+# ============================================================
+
+class BaseballCVDetector:
+
+    def __init__(self):
+        self.model = None
+        self.model_name = None
+
+        try:
+            from baseballcv.functions.load_tools import LoadTools
+
+            loader = LoadTools()
+
+            # Try current ball-tracking model first.
+            model_names = [
+                "ball_trackingv4",
+                "ball_tracking",
+            ]
+
+            for name in model_names:
+
+                try:
+                    self.model = loader.load_model(name)
+                    self.model_name = name
+
+                    print(
+                        f"[INFO] BaseballCV model loaded: {name}"
+                    )
+
+                    break
+
+                except Exception as e:
+                    print(
+                        f"[WARNING] Could not load {name}: {e}"
+                    )
+
+        except Exception as e:
+
+            print(
+                "[WARNING] BaseballCV unavailable:",
+                e
+            )
+
+    def available(self):
+        return self.model is not None
+
+    def detect(self, frame):
+
+        if self.model is None:
+            return []
+
+        try:
+
+            results = self.model.predict(
+                source=frame,
+                verbose=False
+            )
+
+            candidates = []
+
+            for result in results:
+
+                if result.boxes is None:
+                    continue
+
+                for box in result.boxes:
+
+                    xyxy = box.xyxy[0].cpu().numpy()
+
+                    x1, y1, x2, y2 = xyxy
+
+                    confidence = float(
+                        box.conf[0].cpu().numpy()
+                    )
+
+                    x = (x1 + x2) / 2.0
+                    y = (y1 + y2) / 2.0
+
+                    candidates.append({
+                        "x": float(x),
+                        "y": float(y),
+                        "confidence": confidence,
+                        "w": float(x2 - x1),
+                        "h": float(y2 - y1),
+                        "source": "baseballcv"
+                    })
+
+            return candidates
+
+        except Exception as e:
+
+            print(
+                f"[WARNING] BaseballCV inference error: {e}"
+            )
+
+            return []
+
+
+# ============================================================
+# OpenCV fallback detector
+# ============================================================
+
+class OpenCVMotionDetector:
+
+    def __init__(self):
+
+        self.previous_gray = None
+
+    def detect(self, frame):
+
+        if frame is None or frame.size == 0:
+            return []
+
+        height, width = frame.shape[:2]
+
+        gray = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2GRAY
+        )
+
+        if self.previous_gray is None:
+
+            self.previous_gray = gray
+
+            return []
+
+        diff = cv2.absdiff(
+            gray,
+            self.previous_gray
+        )
+
+        self.previous_gray = gray
+
+        hsv = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2HSV
+        )
+
+        brightness = hsv[:, :, 2]
+
+        # Motion + brightness mask.
+        mask = (
+            (diff > 15) &
+            (brightness > 150)
+        ).astype(np.uint8) * 255
+
+        # Remove tiny noise.
+        kernel = np.ones(
+            (3, 3),
+            dtype=np.uint8
+        )
+
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_OPEN,
+            kernel
+        )
+
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        candidates = []
+
+        for contour in contours:
+
+            area = cv2.contourArea(contour)
+
+            if not 3 <= area <= 500:
+                continue
+
+            x, y, w, h = cv2.boundingRect(
+                contour
+            )
+
+            if w > width * 0.15:
+                continue
+
+            if h > height * 0.15:
+                continue
+
+            cx = x + w / 2.0
+            cy = y + h / 2.0
+
+            candidates.append({
+                "x": float(cx),
+                "y": float(cy),
+                "confidence": 0.25,
+                "w": float(w),
+                "h": float(h),
+                "source": "opencv"
+            })
+
+        return candidates
+
+
+# ============================================================
+# Tracking
+# ============================================================
+
+def distance(a, b):
+
+    return math.sqrt(
+        (a["x"] - b["x"]) ** 2 +
+        (a["y"] - b["y"]) ** 2
+    )
+
+
+def select_candidate(
+    candidates,
+    previous,
+    velocity,
+    frame_width,
+    frame_height
+):
+
+    if not candidates:
+        return None
+
+    # First detection: avoid extreme borders.
+    if previous is None:
+
+        center_x = frame_width / 2.0
+        center_y = frame_height / 2.0
+
+        valid = []
+
+        for c in candidates:
+
+            if not (
+                0 <= c["x"] < frame_width and
+                0 <= c["y"] < frame_height
+            ):
+                continue
+
+            score = math.sqrt(
+                (c["x"] - center_x) ** 2 +
+                (c["y"] - center_y) ** 2
+            )
+
+            # Slight preference for small compact objects.
+            score += 0.5 * abs(
+                math.log(
+                    max(c["w"], 1) /
+                    max(c["h"], 1)
+                )
+            )
+
+            score -= 20.0 * c.get(
+                "confidence", 0.0
+            )
+
+            valid.append((score, c))
+
+        if not valid:
+            return None
+
+        return min(
+            valid,
+            key=lambda item: item[0]
+        )[1]
+
+    # Predict next position.
+    pred_x = previous["x"] + velocity[0]
+    pred_y = previous["y"] + velocity[1]
+
+    valid = []
+
+    for c in candidates:
+
+        if not (
+            0 <= c["x"] < frame_width and
+            0 <= c["y"] < frame_height
+        ):
+            continue
+
+        d = math.sqrt(
+            (c["x"] - pred_x) ** 2 +
+            (c["y"] - pred_y) ** 2
+        )
+
+        # Adaptive gate based on frame size.
+        gate = max(
+            45.0,
+            0.12 * math.sqrt(
+                frame_width ** 2 +
+                frame_height ** 2
+            )
+        )
+
+        if d > gate:
+            continue
+
+        shape_penalty = 0.5 * abs(
+            math.log(
+                max(c["w"], 1) /
+                max(c["h"], 1)
+            )
+        )
+
+        confidence_bonus = 25.0 * c.get(
+            "confidence", 0.0
+        )
+
+        score = (
+            d +
+            shape_penalty -
+            confidence_bonus
+        )
+
+        valid.append((score, c))
+
+    if not valid:
+        return None
+
+    return min(
+        valid,
+        key=lambda item: item[0]
+    )[1]
+
+
+def track_frames(
+    frames,
+    backend="auto"
+):
+
+    height, width = frames[0].shape[:2]
+
+    baseballcv_detector = BaseballCVDetector()
+
+    opencv_detector = OpenCVMotionDetector()
+
+    if backend == "baseballcv-yolo":
+
+        if not baseballcv_detector.available():
+
+            raise RuntimeError(
+                "BaseballCV model could not be loaded. "
+                "Please check installation and model download."
+            )
+
+        detector = baseballcv_detector
+        backend_used = "baseballcv"
+
+    elif backend == "opencv-classical":
+
+        detector = opencv_detector
+        backend_used = "opencv-classical"
+
+    else:
+
+        if baseballcv_detector.available():
+
+            detector = baseballcv_detector
+            backend_used = "baseballcv"
+
+        else:
+
+            detector = opencv_detector
+            backend_used = "opencv-classical"
+
+            print(
+                "[WARNING] BaseballCV model unavailable. "
+                "Using OpenCV fallback."
+            )
+
+    points = []
+
+    previous = None
+
+    velocity = (0.0, 0.0)
+
+    missed = 0
+
+    max_missed = 8
+
+    for frame_index, frame in enumerate(frames):
+
+        candidates = detector.detect(frame)
+
+        chosen = select_candidate(
+            candidates,
+            previous,
+            velocity,
+            width,
+            height
+        )
+
+        if chosen is not None:
+
+            if previous is not None:
+
+                dx = chosen["x"] - previous["x"]
+                dy = chosen["y"] - previous["y"]
+
+                velocity = (
+                    0.7 * velocity[0] + 0.3 * dx,
+                    0.7 * velocity[1] + 0.3 * dy
+                )
+
+            previous = chosen.copy()
+
+            missed = 0
+
+            points.append({
+                "frame": frame_index,
+                "x": chosen["x"],
+                "y": chosen["y"],
+                "status": "detected",
+                "confidence": chosen.get(
+                    "confidence", 0.0
+                )
+            })
+
+        else:
+
+            missed += 1
+
+            # Do not create fake detections.
+            points.append({
+                "frame": frame_index,
+                "x": None,
+                "y": None,
+                "status": "not_detected",
+                "confidence": None
+            })
+
+            if missed > max_missed:
+
+                previous = None
+
+                velocity = (0.0, 0.0)
+
+    return points, backend_used
+
+
+# ============================================================
+# Occlusion estimation
+# ============================================================
+
+def estimate_occlusion(points):
+
+    estimated = {}
+
+    detected_indices = [
+        i for i, p in enumerate(points)
+        if p["status"] == "detected"
+        and p["x"] is not None
+    ]
+
+    if len(detected_indices) < 2:
+        return estimated
+
+    for i in range(
+        len(detected_indices) - 1
+    ):
+
+        left = detected_indices[i]
+        right = detected_indices[i + 1]
+
+        gap = right - left
+
+        # Only interpolate short gaps.
+        if gap <= 1 or gap > 8:
+            continue
+
+        p1 = points[left]
+        p2 = points[right]
+
+        for j in range(left + 1, right):
+
+            t = (
+                (j - left) /
+                (right - left)
+            )
+
+            x = (
+                p1["x"] +
+                t * (p2["x"] - p1["x"])
+            )
+
+            y = (
+                p1["y"] +
+                t * (p2["y"] - p1["y"])
+            )
+
+            estimated[j] = {
+                "x": x,
+                "y": y,
+                "status": "occlusion_estimate"
+            }
+
+    return estimated
+
+
+# ============================================================
+# Rendering
+# ============================================================
+
+def draw_dashed_line(
+    frame,
+    p1,
+    p2,
+    color=(0, 165, 255),
+    thickness=2
+):
+
+    p1 = np.array(
+        p1,
+        dtype=float
+    )
+
+    p2 = np.array(
+        p2,
+        dtype=float
+    )
+
+    vector = p2 - p1
+
+    length = np.linalg.norm(vector)
+
+    if length < 1:
+        return
+
+    unit = vector / length
+
+    dash_length = 12
+    gap_length = 8
+
+    current = 0.0
+
+    while current < length:
+
+        end = min(
+            current + dash_length,
+            length
+        )
+
+        start_point = tuple(
+            np.round(
+                p1 + unit * current
+            ).astype(int)
+        )
+
+        end_point = tuple(
+            np.round(
+                p1 + unit * end
+            ).astype(int)
+        )
+
+        cv2.line(
+            frame,
+            start_point,
+            end_point,
+            color,
+            thickness,
+            cv2.LINE_AA
+        )
+
+        current = end + gap_length
+
+
+def render_video(
+    input_path,
+    output_path,
+    csv_path,
+    backend
+):
+
+    frames, fps, width, height = load_video(
+        input_path
+    )
+
+    print(
+        f"[INFO] Loaded video: "
+        f"{width}x{height}, "
+        f"{fps:.2f} FPS, "
+        f"{len(frames)} frames"
+    )
+
+    points, backend_used = track_frames(
+        frames,
+        backend=backend
+    )
+
+    occlusion = estimate_occlusion(
+        points
+    )
+
+    fourcc = cv2.VideoWriter_fourcc(
+        *"mp4v"
+    )
+
+    writer = cv2.VideoWriter(
+        output_path,
+        fourcc,
+        fps,
+        (width, height)
+    )
+
     if not writer.isOpened():
-        raise RuntimeError(f'Could not create output video: {output_path}')
-    font=cv2.FONT_HERSHEY_SIMPLEX
-    for i,src in enumerate(frames):
-        vis=src.copy()
-        hist=[p for p in unique_actual if p.frame<=i]
-        if len(hist)>=2:
-            pts=np.array([[int(p.x),int(p.y)] for p in hist],np.int32)
-            cv2.polylines(vis,[pts],False,(0,220,0),3,cv2.LINE_AA)
-        # Keep trajectory point on duplicated frame, but not falsely label it as new observation.
-        if i in byframe:
-            p=byframe[i]
-            if p.status=='detected-release':
-                cv2.circle(vis,(int(p.x),int(p.y)),20,(255,255,0),3,cv2.LINE_AA)
-                cv2.putText(vis,'RELEASE',(int(p.x)+22,int(p.y)-20),font,0.7,(255,255,0),2,cv2.LINE_AA)
-            elif p.status in ('detected','duplicate-frame-copy'):
-                cv2.rectangle(vis,(int(p.x)-11,int(p.y)-11),(int(p.x)+11,int(p.y)+11),(0,0,255),2,cv2.LINE_AA)
-                cv2.circle(vis,(int(p.x),int(p.y)),3,(0,0,255),-1,cv2.LINE_AA)
-                if p.status=='duplicate-frame-copy':
-                    cv2.putText(vis,'duplicate-frame copy',(int(p.x)+14,int(p.y)+22),font,0.48,(0,0,255),1,cv2.LINE_AA)
-        if i in occmap:
-            (x,y),st=occmap[i]; xy=(int(x),int(y))
-            if i>start:
-                prev_occ=[(j,q) for j,q,s in occ if j<i]
-                if prev_occ:
-                    px,py=prev_occ[-1][1]; draw_dashed_line(vis,(int(px),int(py)),xy,(0,165,255),3)
-                else:
-                    draw_dashed_line(vis,(int(last if False else unique_actual[-1].x),int(unique_actual[-1].y)),xy,(0,165,255),3)
-            cv2.circle(vis,xy,11,(0,165,255),3,cv2.LINE_AA)
-            cv2.putText(vis,'inferred',(xy[0]+14,xy[1]-10),font,0.58,(0,165,255),2,cv2.LINE_AA)
-            if st.startswith('occlusion-estimate'):
-                cv2.drawMarker(vis,xy,(0,165,255),cv2.MARKER_CROSS,26,2,cv2.LINE_AA)
-        # Legend
-        cv2.rectangle(vis,(20,18),(960,122),(0,0,0),-1)
-        cv2.putText(vis,'2D ball tracker | '+backend_used,(36,47),font,0.67,(255,255,255),1,cv2.LINE_AA)
-        cv2.putText(vis,'Red boxes: ball candidate selected by detector',(36,74),font,0.59,(255,255,255),1,cv2.LINE_AA)
-        cv2.putText(vis,'Green: observed track | Orange dashed: estimated continuation',(36,99),font,0.59,(255,255,255),1,cv2.LINE_AA)
-        cv2.putText(vis,f'Frame {i}/{len(frames)-1}',(W-210,38),font,0.58,(255,255,255),1,cv2.LINE_AA)
+
+        raise RuntimeError(
+            f"Cannot create output video: "
+            f"{output_path}"
+        )
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    for i, frame in enumerate(frames):
+
+        vis = frame.copy()
+
+        # Draw observed trajectory.
+        observed = [
+            p for p in points[:i + 1]
+            if p["status"] == "detected"
+            and p["x"] is not None
+        ]
+
+        if len(observed) >= 2:
+
+            poly = np.array(
+                [
+                    [
+                        int(p["x"]),
+                        int(p["y"])
+                    ]
+                    for p in observed
+                ],
+                dtype=np.int32
+            )
+
+            cv2.polylines(
+                vis,
+                [poly],
+                False,
+                (0, 220, 0),
+                2,
+                cv2.LINE_AA
+            )
+
+        # Draw detected ball candidate.
+        p = points[i]
+
+        if (
+            p["status"] == "detected"
+            and p["x"] is not None
+        ):
+
+            x = int(p["x"])
+            y = int(p["y"])
+
+            cv2.circle(
+                vis,
+                (x, y),
+                6,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA
+            )
+
+            cv2.putText(
+                vis,
+                "DETECTED",
+                (x + 10, y - 10),
+                font,
+                0.45,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA
+            )
+
+        # Draw occlusion estimate.
+        if i in occlusion:
+
+            q = occlusion[i]
+
+            x = int(q["x"])
+            y = int(q["y"])
+
+            # Connect nearest previous detection.
+            previous_detected = [
+                p for p in points[:i]
+                if p["status"] == "detected"
+                and p["x"] is not None
+            ]
+
+            if previous_detected:
+
+                prev = previous_detected[-1]
+
+                draw_dashed_line(
+                    vis,
+                    (prev["x"], prev["y"]),
+                    (x, y)
+                )
+
+            cv2.circle(
+                vis,
+                (x, y),
+                8,
+                (0, 165, 255),
+                2,
+                cv2.LINE_AA
+            )
+
+            cv2.putText(
+                vis,
+                "ESTIMATED",
+                (x + 10, y - 10),
+                font,
+                0.45,
+                (0, 165, 255),
+                1,
+                cv2.LINE_AA
+            )
+
+        # Legend.
+        box_width = min(
+            width - 20,
+            680
+        )
+
+        cv2.rectangle(
+            vis,
+            (10, 10),
+            (box_width, 105),
+            (0, 0, 0),
+            -1
+        )
+
+        cv2.putText(
+            vis,
+            "2D Baseball Tracking Prototype",
+            (20, 35),
+            font,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            vis,
+            "Red: detected candidate | Green: observed trajectory",
+            (20, 60),
+            font,
+            0.42,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            vis,
+            "Orange: short-gap occlusion interpolation",
+            (20, 82),
+            font,
+            0.42,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            vis,
+            f"Frame {i}/{len(frames)-1}",
+            (20, 100),
+            font,
+            0.35,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA
+        )
+
         writer.write(vis)
+
     writer.release()
-    # CSV record every frame: observed detection, duplicate-frame copy, occlusion estimate, or no ball track.
-    allpos={p.frame:p for p in points}
-    for fi,(xy,st) in occmap.items():
-        allpos[fi]=TrackPoint(fi,float(xy[0]),float(xy[1]),st,0.25,'trajectory extrapolation')
-    with open(csv_path,'w',newline='',encoding='utf-8-sig') as f:
-        w=csv.writer(f); w.writerow(['frame','time_sec','x_px','y_px','status','confidence','source'])
-        for i in range(len(frames)):
-            p=allpos.get(i)
-            if p is None: w.writerow([i,round(i/fps,4),'','','not_tracked','',''])
-            else: w.writerow([i,round(i/fps,4),round(p.x,2),round(p.y,2),p.status,round(p.confidence,3),p.source])
-    return points,occ,backend_used,fps,W,H
+
+    # Save CSV.
+    with open(
+        csv_path,
+        "w",
+        newline="",
+        encoding="utf-8-sig"
+    ) as f:
+
+        writer_csv = csv.writer(f)
+
+        writer_csv.writerow([
+            "frame",
+            "time_sec",
+            "x",
+            "y",
+            "status",
+            "confidence"
+        ])
+
+        for p in points:
+
+            frame_index = p["frame"]
+
+            writer_csv.writerow([
+                frame_index,
+                round(
+                    frame_index / fps,
+                    4
+                ),
+                p["x"],
+                p["y"],
+                p["status"],
+                p["confidence"]
+            ])
+
+    print("[INFO] Processing complete.")
+    print("[INFO] Backend:", backend_used)
+    print("[INFO] Output video:", output_path)
+    print("[INFO] Output CSV:", csv_path)
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument('input',help='input mp4 path')
-    ap.add_argument('--output',default='baseball_2d_track.mp4')
-    ap.add_argument('--csv',default='baseball_2d_track.csv')
-    ap.add_argument('--backend',choices=['auto','opencv','baseballcv-yolo'],default='auto')
-    args=ap.parse_args()
-    points,occ,backend,fps,W,H=render(args.input,args.output,args.csv,args.backend)
-    print(f'backend={backend} size={W}x{H} fps={fps} tracked={len(points)} occlusion_estimates={len(occ)}')
-    print('detected:',[(p.frame,round(p.x,1),round(p.y,1),p.status) for p in points if p.status in ('detected','detected-release')])
-    print('occlusion:',[(i,xy.tolist(),st) for i,xy,st in occ])
-    print('NOTE: occlusion coordinates are estimates, not detections. OpenCV fallback is not a learned model.')
-if __name__=='__main__': main()
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Robust 2D baseball ball tracking prototype"
+        )
+    )
+
+    parser.add_argument(
+        "input",
+        help="Input video path"
+    )
+
+    parser.add_argument(
+        "--output",
+        default="tracked.mp4",
+        help="Output video path"
+    )
+
+    parser.add_argument(
+        "--csv",
+        default="tracked.csv",
+        help="Output tracking CSV path"
+    )
+
+    parser.add_argument(
+        "--backend",
+        choices=[
+            "auto",
+            "baseballcv-yolo",
+            "opencv-classical"
+        ],
+        default="auto"
+    )
+
+    args = parser.parse_args()
+
+    render_video(
+        args.input,
+        args.output,
+        args.csv,
+        args.backend
+    )
+
+
+if __name__ == "__main__":
+    main()
